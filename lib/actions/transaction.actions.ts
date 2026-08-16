@@ -1,13 +1,7 @@
 "use server";
 
-import { ID, Query } from "node-appwrite";
-import { createAdminClient } from "../appwrite";
 import { parseStringify } from "../utils";
-
-const {
-  APPWRITE_DATABASE_ID: DATABASE_ID,
-  APPWRITE_TRANSACTION_COLLECTION_ID: TRANSACTION_COLLECTION_ID,
-} = process.env;
+import { readDb, writeDb, LocalTransaction } from "../local-db";
 
 export type CreateTransactionProps = {
   name: string;
@@ -22,7 +16,6 @@ export type CreateTransactionProps = {
 // Enhanced sanitization functions
 const sanitizeText = (text: string): string => {
   if (typeof text !== 'string') return '';
-  // Allow most printable characters except control characters
   return text.replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim().slice(0, 255);
 };
 
@@ -33,7 +26,6 @@ const sanitizeId = (id: string): string => {
 
 const sanitizeEmail = (email: string): string => {
   if (typeof email !== 'string') return '';
-  // More comprehensive email validation
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!emailRegex.test(email)) return '';
   return email.toLowerCase().trim().slice(0, 255);
@@ -47,9 +39,11 @@ const sanitizeAmount = (amount: string | number): string => {
 
 export const createTransaction = async (transaction: CreateTransactionProps) => {
   try {
-    const { database } = await createAdminClient();
+    const db = await readDb();
 
-    const sanitizedTransaction = {
+    const sanitizedTransaction: LocalTransaction = {
+      $id: "tx-" + Math.random().toString(36).substring(2, 11),
+      $createdAt: new Date().toISOString(),
       name: sanitizeText(transaction.name),
       amount: sanitizeAmount(transaction.amount),
       senderId: sanitizeId(transaction.senderId),
@@ -61,14 +55,24 @@ export const createTransaction = async (transaction: CreateTransactionProps) => 
       category: "Transfer",
     };
 
-    const newTransaction = await database.createDocument(
-      DATABASE_ID!,
-      TRANSACTION_COLLECTION_ID!,
-      ID.unique(),
-      sanitizedTransaction
-    );
+    db.transactions.push(sanitizedTransaction);
 
-    return parseStringify(newTransaction);
+    // Update balances of the mock accounts
+    const senderBankIndex = db.banks.findIndex(b => b.$id === sanitizedTransaction.senderBankId);
+    if (senderBankIndex !== -1) {
+      db.banks[senderBankIndex].availableBalance -= Number(sanitizedTransaction.amount);
+      db.banks[senderBankIndex].currentBalance -= Number(sanitizedTransaction.amount);
+    }
+
+    const receiverBankIndex = db.banks.findIndex(b => b.$id === sanitizedTransaction.receiverBankId);
+    if (receiverBankIndex !== -1) {
+      db.banks[receiverBankIndex].availableBalance += Number(sanitizedTransaction.amount);
+      db.banks[receiverBankIndex].currentBalance += Number(sanitizedTransaction.amount);
+    }
+
+    await writeDb(db);
+
+    return parseStringify(sanitizedTransaction);
   } catch (error) {
     console.error("[createTransaction ERROR]", error);
     throw new Error(typeof error === 'string' ? error : JSON.stringify(error));
@@ -77,26 +81,15 @@ export const createTransaction = async (transaction: CreateTransactionProps) => 
 
 export const getTransactionsByBankId = async ({ bankId }: { bankId: string }) => {
   try {
-    const { database } = await createAdminClient();
+    const db = await readDb();
 
-    const senderTransactions = await database.listDocuments(
-      DATABASE_ID!,
-      TRANSACTION_COLLECTION_ID!,
-      [Query.equal('senderBankId', bankId)]
-    );
-
-    const receiverTransactions = await database.listDocuments(
-      DATABASE_ID!,
-      TRANSACTION_COLLECTION_ID!,
-      [Query.equal('receiverBankId', bankId)]
+    const relatedTransactions = db.transactions.filter(
+      t => t.senderBankId === bankId || t.receiverBankId === bankId
     );
 
     const transactions = {
-      total: senderTransactions.total + receiverTransactions.total,
-      documents: [
-        ...senderTransactions.documents,
-        ...receiverTransactions.documents,
-      ]
+      total: relatedTransactions.length,
+      documents: relatedTransactions
     };
 
     return parseStringify(transactions);

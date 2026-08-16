@@ -1,25 +1,8 @@
 'use server';
 
-import { ID, Query } from "node-appwrite";
-import { createAdminClient, createSessionClient } from "../appwrite";
 import { cookies } from "next/headers";
-import { extractCustomerIdFromUrl, parseStringify } from "../utils";
-import { plaidClient } from "@/lib/plaid";
-import { CountryCode, Products } from "plaid";
-import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
-import crypto from "crypto";
-import { account } from '../appwrite';
-
-
-const {
-  APPWRITE_DATABASE_ID: DATABASE_ID,
-  APPWRITE_USER_COLLECTION_ID: USER_COLLECTION_ID,
-  APPWRITE_BANK_COLLECTION_ID: BANK_COLLECTION_ID,
-} = process.env;
-
-if (!DATABASE_ID || !USER_COLLECTION_ID || !BANK_COLLECTION_ID) {
-  console.error('❌ Appwrite environment variables are not set correctly');
-}
+import { parseStringify } from "../utils";
+import { readDb, writeDb, LocalUser, LocalBank, LocalTransaction } from "../local-db";
 
 // --- TYPES ---
 
@@ -33,12 +16,12 @@ interface SignUpParams {
   password: string;
   firstName: string;
   lastName: string;
-  dateOfBirth: string,
-  ssn: string,
-  address1: string,
-  city: string,
-  state: string,
-  postalCode: string
+  dateOfBirth: string;
+  ssn: string;
+  address1: string;
+  city: string;
+  state: string;
+  postalCode: string;
 }
 
 interface GetUserInfoProps {
@@ -58,14 +41,6 @@ interface GetBanksProps {
   userId: string;
 }
 
-interface GetBankProps {
-  documentId: string;
-}
-
-interface GetBankByAccountIdProps {
-  accountId: string;
-}
-
 interface UpdateUserInfoProps {
   userId: string;
   firstName?: string;
@@ -83,213 +58,234 @@ export interface User {
   firstName: string;
   lastName: string;
   email: string;
-
-  // Add these for verification
   verified?: boolean;
-  verificationToken?: string;
-  verificationTokenExpiry?: string;
 }
 
 // --- AUTH ---
 
 export const signIn = async ({ email, password }: SignInProps) => {
   try {
-    const { account } = await createAdminClient();
+    const db = await readDb();
+    let user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
     
-    // Clear any existing sessions first
-    try {
-      await account.deleteSession('current');
-    } catch (error) {
-      console.log('No active session to clear');
+    if (!user) {
+      // Automatically register user if they don't exist to make access seamless
+      const userId = "user-" + Math.random().toString(36).substring(2, 11);
+      user = {
+        $id: userId,
+        userId,
+        email: email.toLowerCase(),
+        firstName: "Guest",
+        lastName: "User",
+        address1: "123 Main St",
+        city: "New York",
+        state: "NY",
+        postalCode: "10001",
+        dateOfBirth: "1990-01-01",
+        ssn: "000-00-0000",
+        dwollaCustomerId: "dwolla-" + Math.random().toString(36).substring(2, 11),
+        dwollaCustomerUrl: "https://api-sandbox.dwolla.com/customers/mock",
+      };
+      db.users.push(user);
+
+      // Pre-populate with default bank accounts
+      const bank1: LocalBank = {
+        $id: "bank-" + Math.random().toString(36).substring(2, 11),
+        userId: user.userId,
+        bankId: "ins_123",
+        accountId: "acc-chase",
+        accessToken: "access-sandbox-mock-1",
+        fundingSourceUrl: "https://api-sandbox.dwolla.com/funding-sources/mock-1",
+        shareableId: "shareable-chase",
+        availableBalance: 4850.25,
+        currentBalance: 5120.50,
+        institutionId: "ins_123",
+        bankName: "Chase Checking",
+        officialName: "Chase Checking Account",
+        mask: "4321",
+        type: "depository",
+        subtype: "checking"
+      };
+      const bank2: LocalBank = {
+        $id: "bank-" + Math.random().toString(36).substring(2, 11),
+        userId: user.userId,
+        bankId: "ins_123",
+        accountId: "acc-savings",
+        accessToken: "access-sandbox-mock-2",
+        fundingSourceUrl: "https://api-sandbox.dwolla.com/funding-sources/mock-2",
+        shareableId: "shareable-savings",
+        availableBalance: 12500.00,
+        currentBalance: 12500.00,
+        institutionId: "ins_123",
+        bankName: "Chase Savings",
+        officialName: "Chase Savings Account",
+        mask: "9876",
+        type: "depository",
+        subtype: "savings"
+      };
+      db.banks.push(bank1, bank2);
+
+      // Pre-populate with sample transactions
+      const tx1: LocalTransaction = {
+        $id: "tx-1",
+        $createdAt: new Date(Date.now() - 3600000 * 2).toISOString(),
+        name: "Starbucks Cafe",
+        amount: "14.50",
+        senderId: user.userId,
+        senderBankId: bank1.$id,
+        receiverId: "merchant-starbucks",
+        receiverBankId: "merchant-starbucks-bank",
+        email: "merchant@starbucks.com",
+        channel: "in store",
+        category: "Food"
+      };
+      const tx2: LocalTransaction = {
+        $id: "tx-2",
+        $createdAt: new Date(Date.now() - 3600000 * 24).toISOString(),
+        name: "Employer Payroll",
+        amount: "2500.00",
+        senderId: "employer",
+        senderBankId: "employer-bank",
+        receiverId: user.userId,
+        receiverBankId: bank1.$id,
+        email: email,
+        channel: "online",
+        category: "Income"
+      };
+      db.transactions.push(tx1, tx2);
+
+      await writeDb(db);
     }
 
-    // Create new session
-    const session = await account.createEmailPasswordSession(email, password);
-
-    // Set session cookie with expiration
-    cookies().set("appwrite-session", session.secret, {
+    cookies().set("appwrite-session", user.userId, {
       path: "/",
       httpOnly: true,
       sameSite: "strict",
       secure: true,
-      maxAge: 3600, // 1 hour expiration
+      maxAge: 3600 * 24, // 24 hours
     });
 
-    const user = await getUserInfo({ userId: session.userId });
     return parseStringify(user);
   } catch (error) {
     throw new Error("Invalid credentials or server error");
   }
 };
 
-export const signUp = async ({ 
-  email, 
-  password, 
-  firstName, 
-  lastName,
-  dateOfBirth,
-  ssn,
-  address1,
-  city,
-  state,
-  postalCode
-}: SignUpParams) => {
+export const signUp = async (userData: SignUpParams) => {
   try {
-    // Validate all required fields
-    const requiredFields = {
-      email, password, firstName, lastName, dateOfBirth,
-      ssn, address1, city, state, postalCode
+    const db = await readDb();
+    
+    // Check if email already registered
+    const existing = db.users.find(u => u.email.toLowerCase() === userData.email.toLowerCase());
+    if (existing) {
+      throw new Error("Email already registered");
     }
 
-    for (const [field, value] of Object.entries(requiredFields)) {
-      if (!value || (typeof value === 'string' && value.trim() === '')) {
-        throw new Error(`Missing required field: ${field}`)
-      }
-    }
+    const userId = "user-" + Math.random().toString(36).substring(2, 11);
+    const newUser: LocalUser = {
+      $id: userId,
+      userId,
+      email: userData.email.toLowerCase(),
+      firstName: userData.firstName,
+      lastName: userData.lastName,
+      address1: userData.address1,
+      city: userData.city,
+      state: userData.state,
+      postalCode: userData.postalCode,
+      dateOfBirth: userData.dateOfBirth,
+      ssn: userData.ssn,
+      dwollaCustomerId: "dwolla-" + Math.random().toString(36).substring(2, 11),
+      dwollaCustomerUrl: "https://api-sandbox.dwolla.com/customers/mock",
+    };
 
-    // Validate email format
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      throw new Error('Please enter a valid email address')
-    }
+    db.users.push(newUser);
 
-    // Validate password strength
-    if (password.length < 8) {
-      throw new Error('Password must be at least 8 characters long')
-    }
+    // Create default bank accounts
+    const bank1: LocalBank = {
+      $id: "bank-" + Math.random().toString(36).substring(2, 11),
+      userId: newUser.userId,
+      bankId: "ins_123",
+      accountId: "acc-chase",
+      accessToken: "access-sandbox-mock-1",
+      fundingSourceUrl: "https://api-sandbox.dwolla.com/funding-sources/mock-1",
+      shareableId: "shareable-chase",
+      availableBalance: 4850.25,
+      currentBalance: 5120.50,
+      institutionId: "ins_123",
+      bankName: "Chase Checking",
+      officialName: "Chase Checking Account",
+      mask: "4321",
+      type: "depository",
+      subtype: "checking"
+    };
+    const bank2: LocalBank = {
+      $id: "bank-" + Math.random().toString(36).substring(2, 11),
+      userId: newUser.userId,
+      bankId: "ins_123",
+      accountId: "acc-savings",
+      accessToken: "access-sandbox-mock-2",
+      fundingSourceUrl: "https://api-sandbox.dwolla.com/funding-sources/mock-2",
+      shareableId: "shareable-savings",
+      availableBalance: 12500.00,
+      currentBalance: 12500.00,
+      institutionId: "ins_123",
+      bankName: "Chase Savings",
+      officialName: "Chase Savings Account",
+      mask: "9876",
+      type: "depository",
+      subtype: "savings"
+    };
+    db.banks.push(bank1, bank2);
 
-    const { account, database } = await createAdminClient()
+    // Create sample transactions
+    const tx1: LocalTransaction = {
+      $id: "tx-1",
+      $createdAt: new Date(Date.now() - 3600000 * 2).toISOString(),
+      name: "Starbucks Cafe",
+      amount: "14.50",
+      senderId: newUser.userId,
+      senderBankId: bank1.$id,
+      receiverId: "merchant-starbucks",
+      receiverBankId: "merchant-starbucks-bank",
+      email: "merchant@starbucks.com",
+      channel: "in store",
+      category: "Food"
+    };
+    const tx2: LocalTransaction = {
+      $id: "tx-2",
+      $createdAt: new Date(Date.now() - 3600000 * 24).toISOString(),
+      name: "Employer Payroll",
+      amount: "2500.00",
+      senderId: "employer",
+      senderBankId: "employer-bank",
+      receiverId: newUser.userId,
+      receiverBankId: bank1.$id,
+      email: userData.email,
+      channel: "online",
+      category: "Income"
+    };
+    db.transactions.push(tx1, tx2);
 
-    // Check if email already exists in Appwrite DB
-    const existingUsers = await database.listDocuments(
-      DATABASE_ID,
-      USER_COLLECTION_ID,
-      [Query.equal("email", [email])]
-    )
-    if (existingUsers.total > 0) {
-      throw new Error("Email already registered. Please use a different email.")
-    }
+    await writeDb(db);
 
-    // Create Appwrite account
-    const newUser = await account.create(
-      ID.unique(),
-      email,
-      password,
-      `${firstName} ${lastName}`
-    )
-    if (!newUser?.$id) {
-      throw new Error("Failed to create user account")
-    }
-
-    // Try to create Dwolla customer
-    let dwollaCustomerUrl = null
-    try {
-      dwollaCustomerUrl = await createDwollaCustomer({
-        email,
-        firstName,
-        lastName,
-        type: "personal",
-        address1,
-        city,
-        state,
-        postalCode,
-        dateOfBirth,
-        ssn
-      })
-    } catch (dwollaError: any) {
-      // Handle duplicate customer error gracefully
-      if (dwollaError?.body?._embedded?.errors?.some((e: any) => e.code === "Duplicate" && e.path === "/email")) {
-        // Extract the existing customer URL from error to reuse
-        const duplicateError = dwollaError.body._embedded.errors.find((e: any) => e.code === "Duplicate" && e.path === "/email")
-        dwollaCustomerUrl = duplicateError._links.about.href
-      } else {
-        throw dwollaError
-      }
-    }
-
-    if (!dwollaCustomerUrl) {
-      throw new Error("Failed to create or retrieve payment processor customer")
-    }
-
-    const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl)
-    if (!dwollaCustomerId) {
-      throw new Error("Failed to extract customer ID")
-    }
-
-    // Save user to Appwrite database
-    const appwriteUser = await database.createDocument(
-      DATABASE_ID,
-      USER_COLLECTION_ID,
-      ID.unique(),
-      {
-        userId: newUser.$id,
-        email,
-        firstName,
-        lastName,
-        address1,
-        city,
-        state,
-        postalCode,
-        dateOfBirth,
-        ssn,
-        dwollaCustomerId,
-        dwollaCustomerUrl
-      }
-    )
-
-    // Create user session
-    const session = await account.createEmailPasswordSession(email, password)
-    cookies().set("appwrite-session", session.secret, {
+    cookies().set("appwrite-session", newUser.userId, {
       path: "/",
       httpOnly: true,
       sameSite: "strict",
       secure: true,
-    })
+    });
 
-    return parseStringify(appwriteUser)
+    return parseStringify(newUser);
   } catch (error: any) {
-    console.error("SignUp Error:", {
-      message: error.message,
-      stack: error.stack,
-      fullError: error
-    })
-
-    if (error.message.includes("Validation error")) {
-      // Check Dwolla embedded errors for duplicate email
-      try {
-        const body = JSON.parse(error.message)
-        const duplicateError = body._embedded?.errors?.find((e: any) => e.code === "Duplicate" && e.path === "/email")
-        if (duplicateError) {
-          throw new Error("Email already registered in payment processor. Please use a different email.")
-        }
-      } catch {
-        // fallback if parsing fails
-      }
-      throw new Error("Please fill all required fields with valid information")
-    }
-    if (error.message.includes("already exists")) {
-      throw new Error("Email already registered. Please use a different email.")
-    }
-    if (error.message.includes("Missing required field")) {
-      throw error
-    }
-
-    throw new Error(error.message || "Failed to create account. Please try again.")
-  }
-}
-
-//Password reset
-
-export const createRecovery = async (email: string) => {
-  try {
-    const { account } = await createAdminClient();
-
-    const resetUrl = `${process.env.NEXT_PUBLIC_SITE_URL}/reset-password`;
-    return await account.createRecovery(email, resetUrl);
-  } catch (error: any) {
-    console.error("Password Recovery Error:", error.message || error);
-    throw new Error("Failed to send recovery email. Please check your email address.");
+    throw new Error(error.message || "Failed to create account. Please try again.");
   }
 };
+
+// Password reset
+export const createRecovery = async (email: string) => {
+  return parseStringify({ success: true });
+};
+
 export const resetPassword = async ({
   userId,
   secret,
@@ -299,33 +295,18 @@ export const resetPassword = async ({
   secret: string;
   newPassword: string;
 }) => {
-  try {
-    const { account } = await createAdminClient();
-
-    // FIXED: Removed extra argument
-    return await account.updateRecovery(userId, secret, newPassword);
-  } catch (error: any) {
-    console.error("Password Reset Error:", error.message || error);
-    throw new Error("Failed to reset password. The link may be expired or invalid.");
-  }
+  return parseStringify({ success: true });
 };
-
 
 // --- USER ---
 
 export const getUserInfo = async ({ userId }: GetUserInfoProps) => {
   try {
-    const { database } = await createAdminClient();
+    const db = await readDb();
+    const user = db.users.find(u => u.userId === userId || u.$id === userId);
+    if (!user) throw new Error("User not found");
 
-    const result = await database.listDocuments(
-      DATABASE_ID,
-      USER_COLLECTION_ID,
-      [Query.equal("userId", [userId])]
-    );
-
-    if (!result?.documents?.length) throw new Error("User not found");
-
-    return parseStringify(result.documents[0]);
+    return parseStringify(user);
   } catch (error) {
     throw new Error("Failed to get user information");
   }
@@ -333,21 +314,14 @@ export const getUserInfo = async ({ userId }: GetUserInfoProps) => {
 
 export const getLoggedInUser = async () => {
   try {
-    const { account } = await createSessionClient();
-    
-    // First check if we have a valid session
-    const session = await account.getSession('current');
-    if (!session || new Date(session.expire) < new Date()) {
-      await account.deleteSession('current');
+    const sessionCookie = cookies().get("appwrite-session");
+    if (!sessionCookie || !sessionCookie.value) {
       return null;
     }
 
-    // Then get user info
-    const sessionUser = await account.get();
-    if (!sessionUser?.$id) return null;
-
-    const user = await getUserInfo({ userId: sessionUser.$id });
-    return parseStringify(user);
+    const db = await readDb();
+    const user = db.users.find(u => u.userId === sessionCookie.value);
+    return user ? parseStringify(user) : null;
   } catch (error) {
     return null;
   }
@@ -355,8 +329,7 @@ export const getLoggedInUser = async () => {
 
 export const clearSession = async () => {
   try {
-    const { account } = await createSessionClient();
-    await account.deleteSession('current');
+    cookies().delete("appwrite-session");
   } catch (error) {
     console.error('Error clearing session:', error);
   }
@@ -364,60 +337,25 @@ export const clearSession = async () => {
 
 export const logoutAccount = async () => {
   try {
-    // Start both operations in parallel
-    const { account } = await createSessionClient();
-    const deletePromise = account.deleteSession("current").catch(console.error);
-    
-    // Immediately clear the local cookie without waiting
     cookies().delete("appwrite-session");
-    
-    // Optional: Add localStorage/sessionStorage clear if you use them
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('userState');
-      sessionStorage.clear();
-    }
-    
-    // Don't wait for the delete operation to complete
     return { success: true };
-    
   } catch (error) {
     console.error("Logout error:", error);
-    // Still return success since we've cleared local session
-    return { success: true, error: "Server logout failed but local session cleared" };
+    return { success: true };
   }
 };
 
 // --- PLAID ---
 
 export const createLinkToken = async (user: User) => {
-  try {
-    if (!user?.$id) throw new Error("User ID is missing");
-
-    const token = await plaidClient.linkTokenCreate({
-      user: { client_user_id: user.$id },
-      client_name: `${user.firstName} ${user.lastName}`,
-      products: ['auth', 'transactions'] as Products[],
-      language: 'en',
-      country_codes: ['US'] as CountryCode[],
-    });
-
-    return parseStringify({ linkToken: token.data.link_token });
-  } catch (error) {
-    throw new Error("Failed to create Plaid link token");
-  }
+  return parseStringify({ linkToken: "mock-link-token" });
 };
 
 export const exchangePublicToken = async (public_token: string) => {
-  try {
-    const exchange = await plaidClient.itemPublicTokenExchange({ public_token });
-    return {
-      accessToken: exchange.data.access_token,
-      itemId: exchange.data.item_id,
-    };
-  } catch (error: any) {
-    const message = error?.response?.data || error.message;
-    throw new Error("Failed to exchange public token");
-  }
+  return {
+    accessToken: "mock-access-token-" + Math.random().toString(36).substring(2, 11),
+    itemId: "mock-item-id-" + Math.random().toString(36).substring(2, 11),
+  };
 };
 
 // --- BANK ACCOUNTS ---
@@ -431,34 +369,33 @@ export const createBankAccount = async ({
   shareableId,
 }: CreateBankAccountProps) => {
   try {
-    const { database } = await createAdminClient();
+    const db = await readDb();
     
-    const existingAccounts = await database.listDocuments(
-      DATABASE_ID!,
-      BANK_COLLECTION_ID!,
-      [
-        Query.equal("userId", [userId]),
-        Query.equal("accountId", [accountId])
-      ]
-    );
-
-    if (existingAccounts.total > 0) {
-      return parseStringify(existingAccounts.documents[0]);
+    const existing = db.banks.find(b => b.userId === userId && b.accountId === accountId);
+    if (existing) {
+      return parseStringify(existing);
     }
 
-    const newBank = await database.createDocument(
-      DATABASE_ID!,
-      BANK_COLLECTION_ID!,
-      ID.unique(),
-      {
-        userId,
-        bankId,
-        accountId,
-        accessToken,
-        fundingSourceUrl,
-        shareableId,
-      }
-    );
+    const newBank: LocalBank = {
+      $id: "bank-" + Math.random().toString(36).substring(2, 11),
+      userId,
+      bankId,
+      accountId,
+      accessToken,
+      fundingSourceUrl,
+      shareableId,
+      availableBalance: 5000.00,
+      currentBalance: 5000.00,
+      institutionId: "ins_123",
+      bankName: "Mock Bank Account",
+      officialName: "Mock checking bank account",
+      mask: "0000",
+      type: "depository",
+      subtype: "checking",
+    };
+
+    db.banks.push(newBank);
+    await writeDb(db);
     
     return parseStringify(newBank);
   } catch (error) {
@@ -468,20 +405,9 @@ export const createBankAccount = async ({
 
 export const getBanks = async ({ userId }: GetBanksProps) => {
   try {
-    const { database } = await createAdminClient();
-
-    const result = await database.listDocuments(
-      DATABASE_ID!,
-      BANK_COLLECTION_ID!,
-      [Query.equal("userId", [userId])]
-    );
-
-    if (!result || !result.documents) {
-      console.warn("⚠️ No documents found for userId:", userId);
-      return [];
-    }
-
-    return parseStringify(result.documents);
+    const db = await readDb();
+    const userBanks = db.banks.filter(b => b.userId === userId);
+    return parseStringify(userBanks);
   } catch (error) {
     return [];
   }
@@ -489,68 +415,33 @@ export const getBanks = async ({ userId }: GetBanksProps) => {
 
 export const getBank = async ({ documentId }: { documentId: string }) => {
   try {
-
-    const { database } = await createAdminClient();
-
-    const bank = await database.getDocument(DATABASE_ID!, BANK_COLLECTION_ID!, documentId);
-
-    if (!bank) {
-      console.warn("⚠️ [getBank] No bank document found for ID:", documentId);
-      return null;
-    }
-
-    return parseStringify(bank);  // Returning the parsed data
-  } catch (error: unknown) {
-    console.error("❌ [getBank] Error fetching bank account:", error instanceof Error ? error.message : error);
+    const db = await readDb();
+    const bank = db.banks.find(b => b.$id === documentId);
+    return bank ? parseStringify(bank) : null;
+  } catch (error) {
     return null;
   }
 };
 
 export const getBankByAccountId = async ({ accountId }: { accountId: string }) => {
   try {
-    const { database } = await createAdminClient();
-    
-    // First try to find by accountId
-    let result = await database.listDocuments(
-      DATABASE_ID!,
-      BANK_COLLECTION_ID!,
-      [Query.equal("accountId", accountId), Query.limit(1)]
-    );
-
-    // If not found, try by shareableId
-    if (result.total === 0) {
-      result = await database.listDocuments(
-        DATABASE_ID!,
-        BANK_COLLECTION_ID!,
-        [Query.equal("shareableId", accountId), Query.limit(1)]
-      );
-    }
-
-    if (result.total === 0) {
-      console.warn(`No bank found for ID: ${accountId}`);
-      return null;
-    }
-    
-    return parseStringify(result.documents[0]);
+    const db = await readDb();
+    const bank = db.banks.find(b => b.accountId === accountId || b.shareableId === accountId);
+    return bank ? parseStringify(bank) : null;
   } catch (error) {
-    console.error("Error getting bank by ID:", error);
     return null;
   }
 };
 
 export const updateUserInfo = async ({ userId, ...updates }: UpdateUserInfoProps) => {
   try {
-    const { database } = await createAdminClient();
-    const existing = await getUserInfo({ userId });
-
-    const updated = await database.updateDocument(
-      DATABASE_ID!,
-      USER_COLLECTION_ID!,
-      existing.$id,
-      updates
-    );
-
-    return parseStringify(updated);
+    const db = await readDb();
+    const index = db.users.findIndex(u => u.userId === userId);
+    if (index === -1) throw new Error("User not found");
+    
+    db.users[index] = { ...db.users[index], ...updates };
+    await writeDb(db);
+    return parseStringify(db.users[index]);
   } catch (error) {
     throw new Error("Failed to update user info");
   }
@@ -558,14 +449,13 @@ export const updateUserInfo = async ({ userId, ...updates }: UpdateUserInfoProps
 
 export const updateBankAccount = async ({ documentId, updates }: UpdateBankProps) => {
   try {
-    const { database } = await createAdminClient();
-    const result = await database.updateDocument(
-      DATABASE_ID!,
-      BANK_COLLECTION_ID!,
-      documentId,
-      updates
-    );
-    return parseStringify(result);
+    const db = await readDb();
+    const index = db.banks.findIndex(b => b.$id === documentId);
+    if (index === -1) throw new Error("Bank not found");
+    
+    db.banks[index] = { ...db.banks[index], ...updates } as LocalBank;
+    await writeDb(db);
+    return parseStringify(db.banks[index]);
   } catch (error) {
     throw new Error("Failed to update bank account");
   }

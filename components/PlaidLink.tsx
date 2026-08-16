@@ -1,37 +1,21 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import { Button } from './ui/button';
-import { PlaidLinkOptions, usePlaidLink } from 'react-plaid-link';
 import { useRouter } from 'next/navigation';
-import { createLinkToken } from '@/lib/actions/user.actions';
 import Image from 'next/image';
 
 const PlaidLink = ({ user, variant }: PlaidLinkProps) => {
   const router = useRouter();
-  const [token, setToken] = useState('');
 
-  useEffect(() => {
-    const getLinkToken = async () => {
-      try {
-        const data = await createLinkToken(user);
-        setToken(data?.linkToken);
-      } catch (error) {
-        console.error('Error creating link token:', error);
-      }
-    };
-
-    getLinkToken();
-  }, [user]);
-
-  const onSuccess = async (public_token: string) => {
+  const onSuccess = async () => {
     try {
       const response = await fetch('/api/exchange-token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ public_token }),
+        body: JSON.stringify({ public_token: "mock-public-token-" + Math.random() }),
       });
 
       if (!response.ok) {
@@ -46,31 +30,18 @@ const PlaidLink = ({ user, variant }: PlaidLinkProps) => {
     }
   };
 
-  // Updated config with required products
-  const config: PlaidLinkOptions = {
-    token,
-    onSuccess,
-    // Add this:
-    product: ['auth', 'transactions'], // Required for transactions access
-    // Optional: Add country codes if needed
-    countryCodes: ['US'],
-  };
-
-  const { open, ready } = usePlaidLink(config);
-
   return (
     <>
       {variant === 'primary' ? (
         <Button 
-          onClick={() => open()} 
-          disabled={!ready} 
+          onClick={() => onSuccess()} 
           className="plaidlink-primary"
         >
           Connect bank
         </Button>
       ) : variant === 'ghost' ? (
         <Button 
-          onClick={() => open()} 
+          onClick={() => onSuccess()} 
           variant="ghost" 
           className="plaidlink-ghost"
         >
@@ -85,7 +56,10 @@ const PlaidLink = ({ user, variant }: PlaidLinkProps) => {
           </p>
         </Button>
       ) : (
-        <Button onClick={() => open()} className="plaidlink-default">
+        <Button 
+          onClick={() => onSuccess()} 
+          className="plaidlink-default"
+        >
           <Image
             src="/icons/connect-bank.svg"
             alt="connect bank"

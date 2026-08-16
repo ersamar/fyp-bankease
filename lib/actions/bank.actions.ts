@@ -1,60 +1,11 @@
 "use server";
 
-import {
-  ACHClass,
-  CountryCode,
-  TransferAuthorizationCreateRequest,
-  TransferCreateRequest,
-  TransferNetwork,
-  TransferType,
-} from "plaid";
-import { Query, Models } from "node-appwrite";
-import { createAdminClient } from "../appwrite";
-import { plaidClient } from "../plaid";
 import { parseStringify } from "../utils";
-
 import { getTransactionsByBankId } from "./transaction.actions";
 import { getBanks, getBank } from "./user.actions";
-
-const {
-  APPWRITE_DATABASE_ID: DATABASE_ID,
-  APPWRITE_BANK_COLLECTION_ID: BANK_COLLECTION_ID,
-} = process.env;
-
-if (!DATABASE_ID || !BANK_COLLECTION_ID) {
-  console.error('❌ Appwrite environment variables not configured');
-}
+import { readDb } from "../local-db";
 
 // Types
-interface Bank {
-  $id: string;
-  accessToken: string;
-  shareableId: string;
-  accountId: string;
-}
-
-interface BankDocument extends Models.Document {
-  userId: string;
-  accountId: string;
-  shareableId: string;
-  fundingSourceUrl: string;
-  bankName?: string;
-  accountType?: string;
-}
-
-interface PlaidAccount {
-  account_id: string;
-  balances: {
-    available: number | null;
-    current: number | null;
-  };
-  name: string;
-  official_name: string | null;
-  mask: string | null;
-  type: string;
-  subtype: string | null;
-}
-
 interface AccountResponse {
   id: string;
   availableBalance: number;
@@ -79,19 +30,6 @@ interface TransferTransaction {
   type: string;
 }
 
-interface Transaction {
-  id: string;
-  name: string;
-  paymentChannel: string;
-  type: string;
-  accountId: string;
-  amount: number;
-  pending: boolean;
-  category: string;
-  date: string;
-  image?: string;
-}
-
 interface getAccountsProps {
   userId: string;
 }
@@ -111,8 +49,6 @@ interface getTransactionsProps {
 // Get multiple bank accounts
 export const getAccounts = async ({ userId }: getAccountsProps) => {
   try {
-    const { database } = await createAdminClient();
-
     const banks = await getBanks({ userId }) || [];
     if (banks.length === 0) {
       return parseStringify({
@@ -122,77 +58,27 @@ export const getAccounts = async ({ userId }: getAccountsProps) => {
       });
     }
 
-    const accountDocuments = await database.listDocuments<BankDocument>(
-      DATABASE_ID,
-      BANK_COLLECTION_ID,
-      [Query.equal("userId", [userId])]
-    );
+    const accounts: AccountResponse[] = banks.map((bank: any) => ({
+      id: bank.accountId,
+      availableBalance: bank.availableBalance || 0,
+      currentBalance: bank.currentBalance || 0,
+      institutionId: bank.institutionId || "ins_123",
+      name: bank.bankName || "Checking",
+      officialName: bank.officialName || "",
+      mask: bank.mask || "",
+      type: bank.type || "depository",
+      subtype: bank.subtype || "checking",
+      appwriteItemId: bank.$id,
+      shareableId: bank.shareableId,
+    }));
 
-    const accountShareableIds = new Map<string, string>();
-    accountDocuments.documents.forEach((doc) => {
-      if (doc.accountId && doc.shareableId) {
-        accountShareableIds.set(doc.accountId, doc.shareableId);
-      }
-    });
-
-    const accounts = await Promise.all(
-      banks.map(async (bank: Bank) => {
-        if (!bank.accessToken) return null;
-
-        const accountsResponse = await plaidClient.accountsGet({
-          access_token: bank.accessToken,
-        });
-
-        const institutionId = accountsResponse.data.item.institution_id || '';
-
-        const institution = institutionId
-          ? await getInstitution({ institutionId })
-          : { institution_id: '', name: '', products: [], country_codes: [], url: '', logo: '' };
-
-        if (!bank.$id) return null;
-
-        const filteredAccounts: AccountResponse[] = accountsResponse.data.accounts.map(
-          (accountData: PlaidAccount) => {
-            const realShareableId = accountShareableIds.get(accountData.account_id) || 'default-id';
-
-            return {
-              id: accountData.account_id,
-              availableBalance: accountData.balances.available || 0,
-              currentBalance: accountData.balances.current || 0,
-              institutionId: institution.institution_id,
-              name: accountData.name,
-              officialName: accountData.official_name || '',
-              mask: accountData.mask || '',
-              type: accountData.type,
-              subtype: accountData.subtype || '',
-              appwriteItemId: bank.$id,
-              shareableId: realShareableId,
-            };
-          }
-        );
-
-        return filteredAccounts;
-      })
-    );
-
-    const flattenedAccounts = accounts.flat().filter(Boolean) as AccountResponse[];
-
-    const uniqueAccountsMap = new Map<string, AccountResponse>();
-    flattenedAccounts.forEach((acc) => {
-      if (!uniqueAccountsMap.has(acc.id)) {
-        uniqueAccountsMap.set(acc.id, acc);
-      }
-    });
-
-    const uniqueAccounts = Array.from(uniqueAccountsMap.values());
-
-    const totalBanks = uniqueAccounts.length;
-    const totalCurrentBalance = uniqueAccounts.reduce((total, account) => {
+    const totalBanks = accounts.length;
+    const totalCurrentBalance = accounts.reduce((total, account) => {
       return total + account.currentBalance;
     }, 0);
 
     return parseStringify({
-      data: uniqueAccounts,
+      data: accounts,
       totalBanks,
       totalCurrentBalance,
     });
@@ -210,41 +96,26 @@ export const getAccounts = async ({ userId }: getAccountsProps) => {
 export const getAccount = async ({ appwriteItemId }: getAccountProps) => {
   try {
     if (!appwriteItemId) {
-      throw new Error("Missing Appwrite Bank ID.");
+      throw new Error("Missing Bank ID.");
     }
 
-    let bank: Bank;
-    try {
-      bank = await getBank({ documentId: appwriteItemId });
-    } catch (err) {
+    const bank = await getBank({ documentId: appwriteItemId });
+    if (!bank) {
       throw new Error(`Bank not found with ID: ${appwriteItemId}`);
     }
 
-    if (!bank.accessToken) {
-      return parseStringify({
-        data: null,
-        transactions: [],
-      });
-    }
-
-    const accountsResponse = await plaidClient.accountsGet({
-      access_token: bank.accessToken,
-    });
-
-    const accountData = accountsResponse.data.accounts.find(
-      (acc) => acc.account_id === bank.accountId
-    );
-
-    if (!accountData) {
-      return parseStringify({
-        data: null,
-        transactions: [],
-      });
-    }
-
-    const institution = await getInstitution({
-      institutionId: accountsResponse.data.item.institution_id || '',
-    });
+    const account = {
+      id: bank.accountId,
+      availableBalance: bank.availableBalance || 0,
+      currentBalance: bank.currentBalance || 0,
+      institutionId: bank.institutionId || "ins_123",
+      name: bank.bankName || "Checking",
+      officialName: bank.officialName || "",
+      mask: bank.mask || "",
+      type: bank.type || "depository",
+      subtype: bank.subtype || "checking",
+      appwriteItemId: bank.$id,
+    };
 
     const transferTransactionsData = await getTransactionsByBankId({
       bankId: bank.$id,
@@ -253,35 +124,37 @@ export const getAccount = async ({ appwriteItemId }: getAccountProps) => {
     const transferTransactions: TransferTransaction[] = transferTransactionsData.documents.map((transferData: any) => ({
       id: transferData.$id,
       name: transferData.name || '',
-      amount: transferData.amount || 0,
+      amount: Number(transferData.amount) || 0,
       date: transferData.$createdAt,
       paymentChannel: transferData.channel || '',
       category: transferData.category || '',
       type: transferData.senderBankId === bank.$id ? "debit" : "credit",
     }));
 
-    const plaidTransactions = await getTransactions({ accessToken: bank.accessToken });
+    const db = await readDb();
+    const dbTransactions = db.transactions.filter(t => t.senderBankId === bank.$id || t.receiverBankId === bank.$id);
+    const mappedDbTransactions: TransferTransaction[] = dbTransactions.map((tx: any) => ({
+      id: tx.$id,
+      name: tx.name || '',
+      amount: Number(tx.amount) || 0,
+      date: tx.$createdAt,
+      paymentChannel: tx.channel || 'online',
+      category: tx.category || 'Transfer',
+      type: tx.senderBankId === bank.$id ? "debit" : "credit",
+    }));
 
-    const account = {
-      id: accountData.account_id,
-      availableBalance: accountData.balances.available || 0,
-      currentBalance: accountData.balances.current || 0,
-      institutionId: institution.institution_id,
-      name: accountData.name,
-      officialName: accountData.official_name || '',
-      mask: accountData.mask || '',
-      type: accountData.type,
-      subtype: accountData.subtype || '',
-      appwriteItemId: bank.$id,
-    };
+    const transactionMap = new Map<string, TransferTransaction>();
+    [...transferTransactions, ...mappedDbTransactions].forEach(tx => {
+      transactionMap.set(tx.id, tx);
+    });
 
-    const allTransactions = [...plaidTransactions, ...transferTransactions].sort(
+    const sortedTransactions = Array.from(transactionMap.values()).sort(
       (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
     );
 
     return parseStringify({
       data: account,
-      transactions: allTransactions,
+      transactions: sortedTransactions,
     });
   } catch (error: unknown) {
     console.error("Error getting account:", error);
@@ -294,72 +167,17 @@ export const getAccount = async ({ appwriteItemId }: getAccountProps) => {
 
 // Get bank institution info
 export const getInstitution = async ({ institutionId }: getInstitutionProps) => {
-  try {
-    const institutionResponse = await plaidClient.institutionsGetById({
-      institution_id: institutionId,
-      country_codes: ["US"] as CountryCode[],
-    });
-
-    const inst = institutionResponse.data.institution;
-    return {
-      institution_id: inst.institution_id,
-      name: inst.name,
-      products: inst.products,
-      country_codes: inst.country_codes,
-      url: inst.url,
-      logo: inst.logo,
-    };
-  } catch (error) {
-    console.error("Error getting institution:", error);
-    return {
-      institution_id: '',
-      name: '',
-      products: [],
-      country_codes: [],
-      url: '',
-      logo: '',
-    };
-  }
+  return {
+    institution_id: institutionId || 'ins_123',
+    name: 'Chase Bank',
+    products: ['auth', 'transactions'],
+    country_codes: ['US'],
+    url: 'https://www.chase.com',
+    logo: '',
+  };
 };
 
 // Get Plaid transactions
 export const getTransactions = async ({ accessToken }: getTransactionsProps) => {
-  let hasMore = true;
-  let transactions: Transaction[] = [];
-  let cursor: string | undefined = undefined;
-
-  try {
-    while (hasMore) {
-      const requestData: any = {
-        access_token: accessToken,
-      };
-      if (cursor) {
-        requestData.cursor = cursor;
-      }
-
-      const response = await plaidClient.transactionsSync(requestData);
-
-      const newTransactions: Transaction[] = response.data.added.map((transaction) => ({
-        id: transaction.transaction_id,
-        name: transaction.name,
-        paymentChannel: transaction.payment_channel,
-        type: transaction.payment_channel,
-        accountId: transaction.account_id,
-        amount: transaction.amount,
-        pending: transaction.pending,
-        category: transaction.category ? transaction.category[0] : "",
-        date: transaction.date,
-        image: transaction.logo_url ?? undefined,
-      }));
-
-      transactions.push(...newTransactions);
-      hasMore = response.data.has_more;
-      cursor = response.data.next_cursor;
-    }
-
-    return transactions;
-  } catch (error) {
-    console.error("Error getting transactions:", error);
-    return [];
-  }
+  return [];
 };
