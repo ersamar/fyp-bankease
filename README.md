@@ -21,6 +21,9 @@ BankEase is a modern digital banking application developed and customized as a F
 * Tailwind CSS
 * JavaScript
 * Node.js
+* Plaid API
+* Dwolla API
+* Appwrite
 
 ## Project Development
 
