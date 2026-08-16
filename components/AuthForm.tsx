@@ -70,8 +70,8 @@ const AuthForm = ({ type }: { type: string }) => {
         };
 
         await signUp(userData);
-        toast.success('Account created successfully! Please sign in.');
-        router.push('/sign-in');
+        toast.success('Account created successfully!');
+        window.location.href = '/';
       }
 
       if (type === 'sign-in') {
@@ -80,8 +80,8 @@ const AuthForm = ({ type }: { type: string }) => {
           password: data.password,
         });
         if (response) {
-          router.push('/');
           toast.success('Logged in successfully!');
+          window.location.href = '/';
         }
       }
     } catch (error: any) {

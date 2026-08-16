@@ -161,7 +161,7 @@ export const signIn = async ({ email, password }: SignInProps) => {
       path: "/",
       httpOnly: true,
       sameSite: "strict",
-      secure: true,
+      secure: false,
       maxAge: 3600 * 24, // 24 hours
     });
 
@@ -272,7 +272,7 @@ export const signUp = async (userData: SignUpParams) => {
       path: "/",
       httpOnly: true,
       sameSite: "strict",
-      secure: true,
+      secure: false,
     });
 
     return parseStringify(newUser);
